@@ -1,0 +1,615 @@
+// Fundação do banco de dados — multi-tenant desde o início.
+// Cada empresa-cliente (tenant) tem seus dados isolados por tenantId.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN       // acesso total ao tenant
+  GERENCIA
+  SUPORTE
+  FINANCEIRO
+  RH
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  INVITED
+}
+
+/// Uma empresa-cliente do SaaS (ex: GenPac, ou qualquer outra empresa que assinar o sistema no futuro)
+model Tenant {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique // usado em subdomínio ou URL amigável
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users           User[]
+  refreshTokens   RefreshToken[]
+  auditLogs       AuditLog[]
+  clients         Client[]
+  tickets         Ticket[]
+  tasks           Task[]
+  calls           Call[]
+  agentStatusLogs AgentStatusLog[]
+  clientAttributes ClientAttribute[]
+  ticketTypes     TicketType[]
+  sectors         Sector[]
+  queues          Queue[]
+  queueMembers    QueueMember[]
+  chatSessions    ChatSession[]
+  internalMessages InternalMessage[]
+  whatsappConnection    WhatsAppConnection?
+  whatsappConversations WhatsAppConversation[]
+  whatsappMessages      WhatsAppMessage[]
+  subscription          Subscription?
+
+  /// Provedor de IA escolhido pelo admin (Claude, Gemini ou GPT) — null até
+  /// ser configurado, e a geração de resumo/tipo por IA fica desligada.
+  aiProvider        AiProvider?
+  /// Chave de API do provedor acima, cifrada com AES-256-GCM (ver utils/encryption.ts).
+  /// Nunca é devolvida em texto puro por nenhuma rota — só uma versão mascarada.
+  aiApiKeyEncrypted String?
+
+  @@map("tenants")
+}
+
+enum AiProvider {
+  CLAUDE
+  GEMINI
+  GPT
+}
+
+/// Um usuário — pertence a exatamente um tenant. E-mail é único GLOBALMENTE
+/// (não só dentro do tenant) porque o login não pede mais o nome da empresa:
+/// o tenant é resolvido a partir de qual usuário tem esse e-mail.
+model User {
+  id           String     @id @default(uuid())
+  tenantId     String
+  tenant       Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name         String
+  email        String     @unique
+  passwordHash String
+  role         Role       @default(SUPORTE)
+  status       UserStatus @default(ACTIVE)
+
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  lastLoginAt         DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  refreshTokens   RefreshToken[]
+  auditLogs       AuditLog[]
+  handledTickets  Ticket[]         @relation("TicketHandledBy")
+  calls           Call[]
+  callsReceived   Call[]           @relation("CallTransferredTo")
+  agentStatusLogs AgentStatusLog[]
+  queueMemberships QueueMember[]
+  chatSessions    ChatSession[]
+  internalMessages InternalMessage[]
+  whatsappClaimedConversations WhatsAppConversation[]
+  ticketEvents    TicketEvent[]
+  authTokens      AuthToken[]
+
+  @@index([tenantId])
+  @@map("users")
+}
+
+/// Token de uso único (recuperação de senha, verificação de e-mail) — só o
+/// hash é salvo, nunca o valor puro (mesmo padrão do RefreshToken acima).
+enum AuthTokenPurpose {
+  PASSWORD_RESET
+  EMAIL_VERIFICATION
+}
+
+model AuthToken {
+  id        String           @id @default(uuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  purpose   AuthTokenPurpose
+  tokenHash String           @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  @@index([userId, purpose])
+  @@map("auth_tokens")
+}
+
+/// Guardamos apenas o HASH do refresh token, nunca o valor puro.
+model RefreshToken {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  revoked   Boolean  @default(false)
+  replacedBy String?
+  userAgent String?
+  ip        String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([tenantId])
+  @@map("refresh_tokens")
+}
+
+/// Trilha de auditoria — essencial antes de plugar o módulo de IA por cima.
+model AuditLog {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String   // ex: "LOGIN_SUCCESS", "LOGIN_FAILED", "USER_CREATED"
+  metadata  Json?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@map("audit_logs")
+}
+
+enum ClientStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  CLOSED
+}
+
+enum TicketSource {
+  CALL
+  CHAT
+  MANUAL
+}
+
+enum TaskStatus {
+  PENDING
+  DONE
+}
+
+/// Um cliente da empresa-cliente (ex: um cliente da GenPac que abre chamados) —
+/// não confundir com Tenant, que é a própria empresa assinante do SaaS.
+model Client {
+  id        String       @id @default(uuid())
+  tenantId  String
+  tenant    Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name      String
+  email     String
+  phone     String?
+  cnpj      String?
+  status    ClientStatus @default(ACTIVE)
+  createdAt DateTime     @default(now())
+
+  tickets      Ticket[]
+  calls        Call[]
+  attributes   ClientAttribute[]
+  chatSessions ChatSession[]
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("clients")
+}
+
+/// Característica livre do cliente, definida pelo próprio usuário (ex:
+/// nome="PDV" valor="8", nome="SITEF" valor="" — nome e valor são só texto,
+/// sem catálogo fixo, de propósito).
+model ClientAttribute {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clientId  String
+  client    Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  name      String
+  value     String
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+  @@index([clientId])
+  @@map("client_attributes")
+}
+
+/// Tipo de atendimento definido pelo próprio admin do tenant (ex: "Impressora",
+/// "Dúvidas") — substitui o antigo enum fixo TicketCategory.
+model TicketType {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name      String
+  createdAt DateTime @default(now())
+
+  tickets Ticket[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("ticket_types")
+}
+
+/// Setor responsável definido pelo admin do tenant (ex: "Suporte",
+/// "Desenvolvimento") — pra onde um chamado pode ser encaminhado, além (e
+/// independente) de quem está atribuído individualmente (handledBy).
+model Sector {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name      String
+  createdAt DateTime @default(now())
+
+  tickets Ticket[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("sectors")
+}
+
+/// Um chamado — hoje é sempre criado automaticamente ao finalizar uma
+/// chamada ou um chat (ver `source`); clientId é opcional porque nem todo
+/// contato tem cadastro de Client, daí os campos contactName/contactPhone
+/// como alternativa.
+model Ticket {
+  id          String       @id @default(uuid())
+  tenantId    String
+  tenant      Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clientId    String?
+  client      Client?      @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  contactName  String?
+  contactPhone String?
+  subject     String
+  description String?
+
+  /// "O que foi feito" — gerado por IA quando o tenant tem chave configurada,
+  /// senão fica em branco pro usuário preencher/revisar na tela do chamado.
+  resolutionNotes String?
+
+  ticketTypeId String?
+  ticketType   TicketType? @relation(fields: [ticketTypeId], references: [id], onDelete: SetNull)
+
+  /// Setor pra quem o chamado foi encaminhado (ex: quem abriu é do Suporte
+  /// mas passou pro Desenvolvimento) — separado de handledBy, que é a
+  /// pessoa específica atribuída, não o setor/departamento.
+  sectorId String?
+  sector   Sector? @relation(fields: [sectorId], references: [id], onDelete: SetNull)
+
+  status    TicketStatus @default(OPEN)
+  source    TicketSource @default(MANUAL)
+  createdAt DateTime     @default(now())
+  closedAt  DateTime?
+
+  handledByUserId String?
+  handledBy       User?   @relation("TicketHandledBy", fields: [handledByUserId], references: [id], onDelete: SetNull)
+
+  events TicketEvent[]
+
+  @@index([tenantId])
+  @@index([tenantId, ticketTypeId])
+  @@index([tenantId, sectorId])
+  @@index([clientId])
+  @@index([handledByUserId])
+  @@map("tickets")
+}
+
+/// Fila de atendimento (Conversas) — nome e cor definidos pelo admin.
+model Queue {
+  id             String   @id @default(uuid())
+  tenantId       String
+  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name           String
+  colorClassName String?
+  createdAt      DateTime @default(now())
+
+  members QueueMember[]
+  whatsappConversations WhatsAppConversation[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("queues")
+}
+
+/// Quem enxerga cada fila — configurado pelo admin na tela de filas.
+model QueueMember {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  queueId  String
+  queue    Queue  @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([queueId, userId])
+  @@index([tenantId])
+  @@map("queue_members")
+}
+
+/// Registro leve e efêmero de um atendimento em chat em andamento — sem
+/// conteúdo de mensagem (não persistimos a conversa), só o suficiente pro
+/// Monitor mostrar em tempo real e pra virar Ticket quando finalizado.
+model ChatSession {
+  id       String  @id @default(uuid())
+  tenantId String
+  tenant   Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  clientId String?
+  client   Client? @relation(fields: [clientId], references: [id], onDelete: SetNull)
+
+  contactName String
+  companyName String?
+  startedAt   DateTime  @default(now())
+  endedAt     DateTime?
+
+  whatsappConversation WhatsAppConversation?
+
+  @@index([tenantId, userId])
+  @@index([tenantId, startedAt])
+  @@map("chat_sessions")
+}
+
+/// Tarefa "gerada por IA" a partir de padrões nos tickets — nesta fase o
+/// conteúdo é sempre semeado/manual, simulando o que a IA produziria depois.
+model Task {
+  id          String     @id @default(uuid())
+  tenantId    String
+  tenant      Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  sector      Role
+  title       String
+  description String
+  insight     String
+  status      TaskStatus @default(PENDING)
+  createdAt   DateTime   @default(now())
+
+  @@index([tenantId])
+  @@index([tenantId, sector])
+  @@map("tasks")
+}
+
+enum AgentStatusValue {
+  AVAILABLE
+  PAUSED
+  OFFLINE
+}
+
+/// Um registro "aberto" (endedAt null) por usuário de cada vez — trocar de
+/// status fecha o atual e abre um novo. Duração por status = soma dos
+/// intervalos, é assim que o dashboard calcula tempo disponível/pausado/offline.
+model AgentStatusLog {
+  id        String           @id @default(uuid())
+  tenantId  String
+  tenant    Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status    AgentStatusValue
+  startedAt DateTime         @default(now())
+  endedAt   DateTime?
+
+  @@index([tenantId, userId])
+  @@index([tenantId, startedAt])
+  @@map("agent_status_logs")
+}
+
+enum CallDirection {
+  INBOUND
+  OUTBOUND
+}
+
+/// clientId é opcional — só é preenchido quando dá pra linkar a um Client
+/// real; chamadas simuladas ao vivo no protótipo podem não ter esse link.
+model Call {
+  id       String        @id @default(uuid())
+  tenantId String
+  tenant   Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  clientId String?
+  client   Client?       @relation(fields: [clientId], references: [id], onDelete: SetNull)
+
+  contactName String
+  phone       String
+  direction   CallDirection
+  startedAt   DateTime      @default(now())
+  endedAt     DateTime?
+
+  transferredToUserId String?
+  transferredTo       User?   @relation("CallTransferredTo", fields: [transferredToUserId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, userId])
+  @@index([tenantId, startedAt])
+  @@index([clientId])
+  @@map("calls")
+}
+
+enum InternalMessageType {
+  TEXT
+  IMAGE
+  AUDIO
+  VIDEO
+}
+
+/// Chat interno da equipe — uma sala só por tenant (sem conceito de
+/// "conversa"/DM), todo mundo do tenant vê e manda nela. Anexos ficam em
+/// disco (uploads/internal-chat/<tenantId>/...), nunca servidos por rota
+/// estática — só por /api/internal-chat/attachments/:messageId, que confere
+/// o tenant do dono antes de entregar o arquivo.
+model InternalMessage {
+  id       String              @id @default(uuid())
+  tenantId String
+  tenant   Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type     InternalMessageType
+
+  text               String? // texto da mensagem, ou legenda opcional de mídia
+  attachmentPath     String? // caminho relativo dentro de uploads/internal-chat
+  attachmentMimeType String?
+  attachmentFileName String? // nome original do arquivo, pra exibir/baixar
+
+  createdAt DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@map("internal_messages")
+}
+
+enum WhatsAppConnectionStatus {
+  DISCONNECTED
+  CONNECTING
+  QR_PENDING
+  CONNECTED
+}
+
+enum WhatsAppConversationStatus {
+  OPEN
+  IN_PROGRESS
+  CLOSED
+}
+
+enum WhatsAppMessageDirection {
+  IN
+  OUT
+}
+
+/// Estado da conexão do número de WhatsApp do tenant (via Baileys) — 1 por
+/// tenant. O QR code em si é efêmero e nunca fica salvo aqui (só em memória
+/// no whatsapp.service, que expira em segundos); aqui só o status/número.
+model WhatsAppConnection {
+  id          String                   @id @default(uuid())
+  tenantId    String                   @unique
+  tenant      Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  status      WhatsAppConnectionStatus @default(DISCONNECTED)
+  phoneNumber String?
+  connectedAt DateTime?
+  updatedAt   DateTime                 @updatedAt
+
+  @@map("whatsapp_connections")
+}
+
+/// Uma conversa real de WhatsApp com um contato (remoteJid) — equivalente ao
+/// que "Conversas" simulava localmente antes: aparece numa fila, pode ser
+/// "pega" (cria ChatSession, igual chat-sessions.routes.ts já faz), transferida
+/// e finalizada (vira Ticket via createTicketFromAttendance).
+model WhatsAppConversation {
+  id        String @id @default(uuid())
+  tenantId  String
+  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  remoteJid String
+
+  contactName  String?
+  contactPhone String?
+
+  queueId String?
+  queue   Queue?  @relation(fields: [queueId], references: [id], onDelete: SetNull)
+
+  status WhatsAppConversationStatus @default(OPEN)
+
+  claimedByUserId String?
+  claimedBy       User?     @relation(fields: [claimedByUserId], references: [id], onDelete: SetNull)
+  claimedAt       DateTime?
+
+  chatSessionId String?      @unique
+  chatSession   ChatSession? @relation(fields: [chatSessionId], references: [id], onDelete: SetNull)
+
+  lastMessageAt      DateTime @default(now())
+  lastMessagePreview String?
+  unreadCount        Int      @default(0)
+  createdAt          DateTime @default(now())
+
+  messages WhatsAppMessage[]
+
+  @@unique([tenantId, remoteJid])
+  @@index([tenantId, status])
+  @@map("whatsapp_conversations")
+}
+
+/// Mensagem real trocada por WhatsApp — texto ou mídia (foto/áudio/vídeo),
+/// mesmo padrão de anexo em disco + rota de download autenticada do chat
+/// interno. waMessageId evita duplicar a mesma mensagem em reconexões.
+model WhatsAppMessage {
+  id             String                   @id @default(uuid())
+  tenantId       String
+  tenant         Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversationId String
+  conversation   WhatsAppConversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  waMessageId    String?
+  direction      WhatsAppMessageDirection
+
+  text          String?
+  mediaPath     String?
+  mediaMimeType String?
+
+  createdAt DateTime @default(now())
+
+  @@index([tenantId, conversationId, createdAt])
+  @@map("whatsapp_messages")
+}
+
+enum PlanTier {
+  STARTER
+  PROFISSIONAL
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+}
+
+/// Assinatura paga do tenant — 1 por tenant. O valor cobrado em si não fica
+/// aqui (fica na Asaas); isso só guarda o estado que o app precisa checar
+/// pra liberar/bloquear acesso e mostrar na tela de Admin → Assinatura.
+model Subscription {
+  id                  String             @id @default(uuid())
+  tenantId            String             @unique
+  tenant              Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  planTier            PlanTier
+  voiceAddonEnabled   Boolean            @default(false)
+  status              SubscriptionStatus @default(TRIALING)
+  trialEndsAt         DateTime
+  asaasCustomerId     String?
+  asaasSubscriptionId String?
+  currentPeriodEnd    DateTime?
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  @@map("subscriptions")
+}
+
+enum TicketEventType {
+  STATUS_CHANGED
+  SECTOR_CHANGED
+  ASSIGNEE_CHANGED
+  NOTES_EDITED
+  TYPE_CHANGED
+}
+
+/// Trilha de auditoria de um chamado — quem mudou o quê e quando. Nunca
+/// sobrescrita/apagada (append-only), ao contrário do resolutionNotes em si.
+model TicketEvent {
+  id        String          @id @default(uuid())
+  tenantId  String
+  ticketId  String
+  ticket    Ticket          @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  userId    String?
+  user      User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+  type      TicketEventType
+  oldValue  String?
+  newValue  String?
+  createdAt DateTime        @default(now())
+
+  @@index([tenantId, ticketId, createdAt])
+  @@map("ticket_events")
+}
